@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -15,8 +14,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	metrics "github.com/influxdata/influxdb-client-go/v2/api"
 )
@@ -45,48 +44,33 @@ func init() {
 	flag.IntVar(&opts.numberOfTestObjects, "test-object-count", 1000, "number of test objects to generate")
 }
 
-func getCloudwatchClient() *cloudwatch.Client {
-	config, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		panic(err)
+func createConfig(mw metrics.WriteAPI) aws.Config {
+	c := NewBuildableClient().
+		WithMetricWriter(mw).
+		WithTransportOptions(func(t *http.Transport) {
+			t.ForceAttemptHTTP2 = false
+		})
+	if opts.maxIdleConns > 0 {
+		c = c.WithTransportOptions(func(t *http.Transport) {
+			t.MaxIdleConnsPerHost = opts.maxIdleConns
+		})
 	}
-	return cloudwatch.NewFromConfig(config)
-}
-
-func createConfig(retryer aws.Retryer) aws.Config {
-	var (
-		cfg aws.Config
-		err error
-	)
-	if opts.maxIdleConns == 0 {
-		cfg, err = config.LoadDefaultConfig(context.TODO())
-	} else {
-		transport := *(http.DefaultTransport.(*http.Transport))
-		transport.MaxIdleConnsPerHost = opts.maxIdleConns
-		transport.TLSClientConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-		cfg, err = config.LoadDefaultConfig(context.TODO(), config.WithHTTPClient(&http.Client{Transport: &transport}), config.WithRetryer(func() aws.Retryer {
-			return retryer
-		}))
-	}
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithHTTPClient(c))
 	if err != nil {
 		panic(err)
 	}
 	return cfg
 }
 
-func getS3Client(retryer aws.Retryer) func() *s3.Client {
+func getS3Client(mw metrics.WriteAPI) func() *s3.Client {
 	var (
 		cfg    aws.Config
 		client *s3.Client
 	)
 
-	cfg = createConfig(retryer)
+	cfg = createConfig(mw)
 	if cfg.HTTPClient != nil {
-		hc := cfg.HTTPClient.(*http.Client)
-		transport := hc.Transport.(*http.Transport)
-		fmt.Printf("DisableCompression: %v\nDisableKeepAlives: %v\nExpectContinueTimeout: %v\nForceAttemptHTTP2: %v\nIdleConnTimeout: %v\nMaxConnsPerHost: %v\nMaxIdleConns: %v\nMaxIdleConnsPerHost: %v\nMaxResponseHeaderBytes: %v\nReadBufferSize: %d\nResponseHeaderTimeout: %v\nTLSHandshakeTimeout: %v\nTLSTransportMinVersion: %v\n", transport.DisableCompression, transport.DisableKeepAlives, transport.ExpectContinueTimeout, transport.ForceAttemptHTTP2, transport.IdleConnTimeout, transport.MaxConnsPerHost, transport.MaxIdleConns, transport.MaxIdleConnsPerHost, transport.MaxResponseHeaderBytes, transport.ReadBufferSize, transport.ResponseHeaderTimeout, transport.TLSHandshakeTimeout, transport.TLSClientConfig.MinVersion)
+		fmt.Println("using a custom http client config")
 	}
 	client = s3.NewFromConfig(cfg)
 	return func() *s3.Client {
@@ -96,7 +80,7 @@ func getS3Client(retryer aws.Retryer) func() *s3.Client {
 		if opts.reuseConfig {
 			return s3.NewFromConfig(cfg)
 		}
-		return s3.NewFromConfig(createConfig(retryer))
+		return s3.NewFromConfig(createConfig(mw))
 	}
 }
 
@@ -171,8 +155,7 @@ func main() {
 	wg.Add(opts.concurrency)
 	mw, close := createMetricWriter()
 	defer close()
-	mt := NewMetricRetryer(mw)
-	s3ClientFactory := getS3Client(mt)
+	s3ClientFactory := getS3Client(mw)
 	for i := 0; i < opts.concurrency; i++ {
 		c := &Client{
 			id:            i,
