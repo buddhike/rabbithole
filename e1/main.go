@@ -5,6 +5,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -29,6 +31,8 @@ type options struct {
 	generateObjects     bool
 	numberOfTestObjects int
 	maxIdleConns        int
+	endpoint            string
+	url                 string
 }
 
 var opts *options = &options{}
@@ -42,7 +46,20 @@ func init() {
 	flag.IntVar(&opts.maxIdleConns, "max-idle-conns", 0, "adjust MaxIdleConns setting in http.Transport")
 	flag.BoolVar(&opts.generateObjects, "generate-objects", false, "generate test objects in s3")
 	flag.IntVar(&opts.numberOfTestObjects, "test-object-count", 1000, "number of test objects to generate")
+	flag.StringVar(&opts.endpoint, "endpoint", "", "s3 vpc endpoint url")
+	flag.StringVar(&opts.url, "url", "", "url to test standard non aws sdk client behaviour")
 }
+
+var resolveEndpoint = aws.EndpointResolverFunc(func(service, region string) (aws.Endpoint, error) {
+	if service == s3.ServiceID && opts.endpoint != "" {
+		return aws.Endpoint{
+			PartitionID:   "aws",
+			URL:           opts.endpoint,
+			SigningRegion: region,
+		}, nil
+	}
+	return aws.Endpoint{}, &aws.EndpointNotFoundError{}
+})
 
 func createConfig(mw metrics.WriteAPI) aws.Config {
 	c := NewBuildableClient().
@@ -55,14 +72,14 @@ func createConfig(mw metrics.WriteAPI) aws.Config {
 			t.MaxIdleConnsPerHost = opts.maxIdleConns
 		})
 	}
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithHTTPClient(c))
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithHTTPClient(c), config.WithEndpointResolver(resolveEndpoint))
 	if err != nil {
 		panic(err)
 	}
 	return cfg
 }
 
-func getS3Client(mw metrics.WriteAPI) func() *s3.Client {
+func createS3Client(mw metrics.WriteAPI) func() *s3.Client {
 	var (
 		cfg    aws.Config
 		client *s3.Client
@@ -138,9 +155,7 @@ func createMetricWriter() (metrics.WriteAPI, func()) {
 	}
 }
 
-func main() {
-	log.SetFlags(log.Flags() | log.Lshortfile)
-	flag.Parse()
+func testS3GetObject() {
 	duration, err := time.ParseDuration(opts.duration)
 	if err != nil {
 		panic(err)
@@ -155,7 +170,7 @@ func main() {
 	wg.Add(opts.concurrency)
 	mw, close := createMetricWriter()
 	defer close()
-	s3ClientFactory := getS3Client(mw)
+	s3ClientFactory := createS3Client(mw)
 	for i := 0; i < opts.concurrency; i++ {
 		c := &Client{
 			id:            i,
@@ -168,4 +183,53 @@ func main() {
 		c.Go(ctx)
 	}
 	wg.Wait()
+}
+
+func testStandardHttpClient() {
+	duration, err := time.ParseDuration(opts.duration)
+	if err != nil {
+		panic(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	defer cancel()
+	wg := &sync.WaitGroup{}
+	wg.Add(opts.concurrency)
+	mw, close := createMetricWriter()
+	defer close()
+	t := *(http.DefaultTransport.(*http.Transport))
+	tt := NewTracingRoundTripper(&t, mw)
+	c := &http.Client{Transport: tt}
+	for i := 0; i < opts.concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					r, err := c.Get(opts.url)
+					if err != nil {
+						log.Printf("error %v: err", err)
+					}
+					if r != nil && r.Body != nil {
+						_, err := io.Copy(ioutil.Discard, r.Body)
+						if err != nil {
+							log.Printf("error draining body reader: %v", err)
+						}
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func main() {
+	log.SetFlags(log.Flags() | log.Lshortfile)
+	flag.Parse()
+	if opts.url == "" {
+		testS3GetObject()
+	} else {
+		testStandardHttpClient()
+	}
 }
