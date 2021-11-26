@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"io/ioutil"
 	"log"
 	"sync"
@@ -27,28 +28,28 @@ type Client struct {
 func (c *Client) Go(ctx context.Context) {
 	go func() {
 		defer c.wg.Done()
-		counter := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
 				start := time.Now()
-				res, err := c.provider().GetObject(ctx, &s3.GetObjectInput{
+				rctx, cancel := context.WithCancel(ctx)
+				res, err := c.provider().GetObject(rctx, &s3.GetObjectInput{
 					Bucket: &c.bucket,
 					Key:    &c.key,
 				})
 				if err != nil {
+					cancel()
 					log.Printf("INFO: GetObject failed %v", err)
 					if serr, ok := err.(smithy.APIError); ok {
-						log.Printf("INFO: GetObject faild %v", serr.ErrorMessage())
 						if serr.ErrorFault() == smithy.FaultClient {
 							return
 						}
 					}
 					continue
 				}
-				_, err = ioutil.ReadAll(res.Body)
+				_, err = io.Copy(ioutil.Discard, res.Body)
 				if err != nil {
 					log.Printf("INFO: failed to read body: %v", err)
 				}
@@ -57,7 +58,7 @@ func (c *Client) Go(ctx context.Context) {
 					log.Printf("INFO: failed to close body: %v", err)
 				}
 				duration := time.Since(start)
-				counter += 1
+				cancel()
 				c.metricsWriter.WritePoint(
 					influxdb2.NewPointWithMeasurement("get-object").
 						AddField("duration", duration.Milliseconds()).
