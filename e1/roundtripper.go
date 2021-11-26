@@ -36,7 +36,7 @@ func (r *TracingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 		},
 		GotConn: func(info httptrace.GotConnInfo) {
 			r.mw.WritePoint(influxdb2.NewPointWithMeasurement("wait-for-conn").AddField("duration", time.Since(getConn).Microseconds()))
-			if info.Reused {
+			if info.WasIdle {
 				r.mw.WritePoint(influxdb2.NewPointWithMeasurement("conn-reused").AddField("count", 1))
 			} else {
 				r.mw.WritePoint(influxdb2.NewPointWithMeasurement("conn-created").AddField("count", 1))
@@ -49,7 +49,9 @@ func (r *TracingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 			connStart = time.Now()
 		},
 		ConnectDone: func(network, addr string, err error) {
-			r.mw.WritePoint(influxdb2.NewPointWithMeasurement("conn-handshake").AddField("duration", time.Since(connStart).Microseconds()))
+			if err == nil {
+				r.mw.WritePoint(influxdb2.NewPointWithMeasurement("conn-handshake").AddField("duration", time.Since(connStart).Microseconds()))
+			}
 		},
 		TLSHandshakeStart: func() {
 			tlsStart = time.Now()
