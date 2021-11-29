@@ -33,6 +33,7 @@ type options struct {
 	maxIdleConns        int
 	endpoint            string
 	url                 string
+	useV1               bool
 }
 
 var opts *options = &options{}
@@ -48,6 +49,7 @@ func init() {
 	flag.IntVar(&opts.numberOfTestObjects, "test-object-count", 1000, "number of test objects to generate")
 	flag.StringVar(&opts.endpoint, "endpoint", "", "s3 vpc endpoint url")
 	flag.StringVar(&opts.url, "url", "", "url to test standard non aws sdk client behaviour")
+	flag.BoolVar(&opts.useV1, "use-v1", false, "use sdk v1")
 }
 
 var resolveEndpoint = aws.EndpointResolverFunc(func(service, region string) (aws.Endpoint, error) {
@@ -185,6 +187,28 @@ func testS3GetObject() {
 	wg.Wait()
 }
 
+func testS3GetObjectV1() {
+	duration, err := time.ParseDuration(opts.duration)
+	if err != nil {
+		panic(err)
+	}
+	bucket, key := decodeBucketParts(opts.s3Path)
+	if opts.generateObjects {
+		generateTestObjects(bucket, key)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	defer cancel()
+	wg := &sync.WaitGroup{}
+	wg.Add(opts.concurrency)
+	mw, close := createMetricWriter()
+	defer close()
+	for i := 0; i < opts.concurrency; i++ {
+		c := NewClientV1(i, bucket, fmt.Sprintf("%s/%d/%d.obj", key, i, i), wg, mw, opts.maxIdleConns)
+		c.Go(ctx)
+	}
+	wg.Wait()
+}
+
 func testStandardHttpClient() {
 	duration, err := time.ParseDuration(opts.duration)
 	if err != nil {
@@ -227,9 +251,12 @@ func testStandardHttpClient() {
 func main() {
 	log.SetFlags(log.Flags() | log.Lshortfile)
 	flag.Parse()
-	if opts.url == "" {
-		testS3GetObject()
-	} else {
+	switch {
+	case opts.url != "":
 		testStandardHttpClient()
+	case opts.useV1:
+		testS3GetObjectV1()
+	default:
+		testS3GetObject()
 	}
 }
